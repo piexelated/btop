@@ -692,6 +692,7 @@ namespace Cpu {
 					width_left -= (gpu.supported_functions.mem_used ? 5 : 0);
 					width_left -= (gpu.supported_functions.mem_total ? 6 : 0);
 					width_left -= (gpu.supported_functions.pwr_usage ? 6 : 0);
+					width_left -= (gpu.supported_functions.gpu_clock ? 8 : 0);
 					if (gpu.supported_functions.gpu_utilization) {
 						gpu_meters[i] = Draw::Meter{width_left, "cpu" };
 					}
@@ -949,6 +950,9 @@ namespace Cpu {
 					continue;
 				out += Mv::to(b_y + ++cy, b_x + 1) + Theme::c("main_fg") + Fx::b + "GPU";
 				if (gpus.size() > 1) out += rjust(to_string(i), 1 + (gpus.size() > 9));
+				if (gpus[i].supported_functions.gpu_clock) {
+					out += ' ' + Theme::c("main_fg") + rjust(to_string(gpus[i].gpu_clock_speed), 4) + "MHz";
+				}
 				if (gpus[i].supported_functions.gpu_utilization) {
 					out += ' ';
 					if (b_columns > 1) {
