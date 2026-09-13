@@ -950,6 +950,12 @@ namespace Cpu {
 					continue;
 				out += Mv::to(b_y + ++cy, b_x + 1) + Theme::c("main_fg") + Fx::b + "GPU";
 				if (gpus.size() > 1) out += rjust(to_string(i), 1 + (gpus.size() > 9));
+				if (not gpus[i].monitor_status.empty()) {
+					out += ' ' + Theme::c("inactive_fg") + gpus[i].monitor_status;
+					out += string(std::max(0, b_width - 5 - (int)gpus[i].monitor_status.size()), ' ');
+					if (cy > b_height - 1) break;
+					continue;
+				}
 				if (gpus[i].supported_functions.gpu_clock) {
 					out += ' ' + Theme::c("main_fg") + rjust(to_string(gpus[i].gpu_clock_speed), 4) + "MHz";
 				}
@@ -1047,6 +1053,15 @@ namespace Gpu {
 		string out;
 		int height = gpu_b_height_offsets[index] + 4;
 		out.reserve(width * height);
+
+		if (not gpu.monitor_status.empty()) {
+			out += box[index];
+			for (int row = 1; row < height - 1; ++row)
+				out += Mv::to(y + row, x + 1) + string(width - 2, ' ');
+			out += Mv::to(y + 2, x + 3) + Theme::c("main_fg") + gpu.monitor_status;
+			redraw[index] = true;
+			return out + Fx::reset;
+		}
 
 		//* Redraw elements not needed to be updated every cycle
 		if (redraw[index]) {

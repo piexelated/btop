@@ -208,7 +208,7 @@ namespace Gpu {
 		nvmlReturn_t (*nvmlInit)();
 		nvmlReturn_t (*nvmlShutdown)();
 		nvmlReturn_t (*nvmlDeviceGetCount)(unsigned int*);
-		nvmlReturn_t (*nvmlDeviceGetHandleByIndex)(unsigned int, nvmlDevice_t*);
+		nvmlReturn_t (*nvmlDeviceGetHandleByPciBusId_v2)(const char*, nvmlDevice_t*);
 		nvmlReturn_t (*nvmlDeviceGetName)(nvmlDevice_t, char*, unsigned int);
 		nvmlReturn_t (*nvmlDeviceGetPowerManagementLimit)(nvmlDevice_t, unsigned int*);
 		nvmlReturn_t (*nvmlDeviceGetTemperatureThreshold)(nvmlDevice_t, nvmlTemperatureThresholds_t, unsigned int*);
@@ -229,6 +229,8 @@ namespace Gpu {
 		bool shutdown();
 		template <bool is_init> bool collect(gpu_info* gpus_slice);
 		vector<nvmlDevice_t> devices;
+		vector<fs::path> pci_devices;
+		vector<bool> probed;
 		unsigned int device_count = 0;
 	}
 
@@ -1323,6 +1325,18 @@ namespace Gpu {
 		bool init() {
 			if (initialized) return false;
 
+			// Enumerate through sysfs without opening a NVIDIA device or initializing NVML.
+			std::error_code ec;
+			for (const auto& entry : fs::directory_iterator("/sys/bus/pci/devices", ec)) {
+				string vendor, device_class;
+				ifstream(entry.path() / "vendor") >> vendor;
+				ifstream(entry.path() / "class") >> device_class;
+				if (vendor == "0x10de" and (device_class.starts_with("0x0300") or device_class.starts_with("0x0302")))
+					pci_devices.push_back(entry.path());
+			}
+			std::sort(pci_devices.begin(), pci_devices.end());
+			if (pci_devices.empty()) return false;
+
 			//? Dynamic loading & linking
 			//? Try possible library names for libnvidia-ml.so
 			const array libNvAlts = {
@@ -1356,7 +1370,7 @@ namespace Gpu {
 		    LOAD_SYM(nvmlInit);
 		    LOAD_SYM(nvmlShutdown);
 		    LOAD_SYM(nvmlDeviceGetCount);
-		    LOAD_SYM(nvmlDeviceGetHandleByIndex);
+		    LOAD_SYM(nvmlDeviceGetHandleByPciBusId_v2);
 		    LOAD_SYM(nvmlDeviceGetName);
 		    LOAD_SYM(nvmlDeviceGetPowerManagementLimit);
 		    LOAD_SYM(nvmlDeviceGetTemperatureThreshold);
@@ -1372,63 +1386,90 @@ namespace Gpu {
 
             #undef LOAD_SYM
 
-			//? Function calls
-			nvmlReturn_t result = nvmlInit();
-    		if (result != NVML_SUCCESS) {
-    			Logger::debug("Failed to initialize NVML, NVIDIA GPUs will not be detected: {}", nvmlErrorString(result));
-    			return false;
-    		}
-
-			//? Device count
-			result = nvmlDeviceGetCount(&device_count);
-    		if (result != NVML_SUCCESS) {
-    			Logger::warning("NVML: Failed to get device count: {}", nvmlErrorString(result));
-    			return false;
-    		}
-
-			if (device_count > 0) {
-				devices.resize(device_count);
-				gpus.resize(device_count);
-				gpu_names.resize(device_count);
-
-				initialized = true;
-
-				//? Check supported functions & get maximums
-				Nvml::collect<1>(gpus.data());
-
-				return true;
-			} else {initialized = true; shutdown(); return false;}
+			device_count = pci_devices.size();
+			devices.resize(device_count);
+			probed.resize(device_count, false);
+			gpus.resize(device_count);
+			gpu_names.resize(device_count);
+			for (unsigned int i = 0; i < device_count; ++i) {
+				gpu_names[i] = "NVIDIA " + pci_devices[i].filename().string();
+				for (auto& [_, history] : gpus[i].gpu_percent) history.push_back(0);
+			}
+			initialized = true; // Library loaded, not a persistent NVML attachment.
+			collect<1>(gpus.data());
+			return true;
 		}
 
 		bool shutdown() {
 			if (!initialized) return false;
-			nvmlReturn_t result = nvmlShutdown();
-			if (NVML_SUCCESS == result) {
-				initialized = false;
-				dlclose(nvml_dl_handle);
-			} else Logger::warning("Failed to shutdown NVML: {}", nvmlErrorString(result));
-
-			return !initialized;
+			initialized = false;
+			dlclose(nvml_dl_handle);
+			return true;
 		}
 
 		template <bool is_init> // collect<1> is called in Nvml::init(), and populates gpus.supported_functions
 		bool collect(gpu_info* gpus_slice) { // raw pointer to vector data, size == device_count
 			if (!initialized) return false;
 
+			// nvmlInit can attach every NVIDIA GPU, so skip it if any is not active.
+			// Unknown/missing state is deliberately treated as unsafe to query.
+			bool all_active = true;
+			vector<string> states;
+			for (const auto& pci : pci_devices) {
+				string state;
+				ifstream(pci / "power/runtime_status") >> state;
+				states.push_back(state);
+				all_active = all_active and state == "active";
+			}
+			if (!all_active) {
+				for (unsigned int i = 0; i < device_count; ++i) {
+					auto& gpu = gpus_slice[i];
+					gpu.monitor_status = states[i] == "suspended" ? "Sleeping" : "Monitoring paused";
+					gpu.gpu_clock_speed = 0;
+					gpu.mem_clock_speed = 0;
+					gpu.pwr_usage = 0;
+					gpu.pwr_state = 32;
+					gpu.mem_used = 0;
+					gpu.encoder_utilization = gpu.decoder_utilization = 0;
+					gpu.pcie_tx = gpu.pcie_rx = 0;
+					for (auto& [_, history] : gpu.gpu_percent) history.push_back(0);
+					gpu.mem_utilization_percent.push_back(0);
+				}
+				return true;
+			}
+			if (nvmlInit() != NVML_SUCCESS) {
+				for (unsigned int i = 0; i < device_count; ++i)
+					gpus_slice[i].monitor_status = "Monitoring unavailable";
+				return false;
+			}
+			// Release NVML after every sample, including exceptions, so btop holds no
+			// NVIDIA handle between refreshes. Threads below join before this guard.
+			struct Sample {
+				~Sample() { nvmlShutdown(); }
+			} sample;
+			for (unsigned int i = 0; i < device_count; ++i) {
+				if (!gpus_slice[i].monitor_status.empty()) {
+					if (i < redraw.size()) redraw[i] = true;
+					Cpu::redraw = true;
+				}
+				gpus_slice[i].monitor_status.clear();
+			}
+
 			nvmlReturn_t result;
 			join_thread pcie_tx_thread;
 			join_thread pcie_rx_thread;
 			// DebugTimer nvTotalTimer("Nvidia Total");
 			for (unsigned int i = 0; i < device_count; ++i) {
-				if constexpr(is_init) {
-					//? Device Handle
-    				result = nvmlDeviceGetHandleByIndex(i, devices.data() + i);
+				// Handles are only valid for this NVML sample. Match PCI IDs, not NVML order.
+				const bool probe = !probed[i];
+				result = nvmlDeviceGetHandleByPciBusId_v2(pci_devices[i].filename().c_str(), devices.data() + i);
         			if (result != NVML_SUCCESS) {
     					Logger::warning("NVML: Failed to get device handle: {}", nvmlErrorString(result));
-						gpus[i].supported_functions = {false, false, false, false, false, false, false, false, false, false};
+						gpus_slice[i].monitor_status = "Monitoring unavailable";
     					continue;
         			}
 
+				if (probe) {
 					//? Device name
 					char name[NVML_DEVICE_NAME_BUFFER_SIZE];
     				result = nvmlDeviceGetName(devices[i], name, NVML_DEVICE_NAME_BUFFER_SIZE);
@@ -1461,13 +1502,13 @@ namespace Gpu {
 				}
 
 				//? PCIe link speeds, the data collection takes >=20ms each call so they run on separate threads
-				if (gpus_slice[i].supported_functions.pcie_txrx and (Config::getB("nvml_measure_pcie_speeds") or is_init)) {
-					pcie_tx_thread = join_thread([gpus_slice, i]() {
+				if (gpus_slice[i].supported_functions.pcie_txrx and (Config::getB("nvml_measure_pcie_speeds") or probe)) {
+					pcie_tx_thread = join_thread([gpus_slice, i, probe]() {
 						unsigned int tx;
 						nvmlReturn_t result = nvmlDeviceGetPcieThroughput(devices[i], NVML_PCIE_UTIL_TX_BYTES, &tx);
     					if (result != NVML_SUCCESS) {
 							Logger::warning("NVML: Failed to get PCIe TX throughput: {}", nvmlErrorString(result));
-							if constexpr(is_init) gpus_slice[i].supported_functions.pcie_txrx = false;
+							if (probe) gpus_slice[i].supported_functions.pcie_txrx = false;
 						} else gpus_slice[i].pcie_tx = (long long)tx;
 					});
 
@@ -1490,8 +1531,8 @@ namespace Gpu {
 					result = nvmlDeviceGetUtilizationRates(devices[i], &utilization);
     				if (result != NVML_SUCCESS) {
 						Logger::warning("NVML: Failed to get GPU utilization: {}", nvmlErrorString(result));
-						if constexpr(is_init) gpus_slice[i].supported_functions.gpu_utilization = false;
-						if constexpr(is_init) gpus_slice[i].supported_functions.mem_utilization = false;
+						if (probe) gpus_slice[i].supported_functions.gpu_utilization = false;
+						if (probe) gpus_slice[i].supported_functions.mem_utilization = false;
     				} else {
 						gpus_slice[i].gpu_percent.at("gpu-totals").push_back((long long)utilization.gpu);
 						gpus_slice[i].mem_utilization_percent.push_back((long long)utilization.memory);
@@ -1505,7 +1546,7 @@ namespace Gpu {
 					result = nvmlDeviceGetClockInfo(devices[i], NVML_CLOCK_GRAPHICS, &gpu_clock);
     				if (result != NVML_SUCCESS) {
 						Logger::warning("NVML: Failed to get GPU clock speed: {}", nvmlErrorString(result));
-						if constexpr(is_init) gpus_slice[i].supported_functions.gpu_clock = false;
+						if (probe) gpus_slice[i].supported_functions.gpu_clock = false;
 					} else gpus_slice[i].gpu_clock_speed = (long long)gpu_clock;
 				}
 
@@ -1514,7 +1555,7 @@ namespace Gpu {
 					result = nvmlDeviceGetClockInfo(devices[i], NVML_CLOCK_MEM, &mem_clock);
     				if (result != NVML_SUCCESS) {
 						Logger::warning("NVML: Failed to get VRAM clock speed: {}", nvmlErrorString(result));
-						if constexpr(is_init) gpus_slice[i].supported_functions.mem_clock = false;
+						if (probe) gpus_slice[i].supported_functions.mem_clock = false;
 					} else gpus_slice[i].mem_clock_speed = (long long)mem_clock;
 				}
 
@@ -1525,7 +1566,7 @@ namespace Gpu {
     				result = nvmlDeviceGetPowerUsage(devices[i], &power);
     				if (result != NVML_SUCCESS) {
 						Logger::warning("NVML: Failed to get GPU power usage: {}", nvmlErrorString(result));
-						if constexpr(is_init) gpus_slice[i].supported_functions.pwr_usage = false;
+						if (probe) gpus_slice[i].supported_functions.pwr_usage = false;
     				} else {
     					gpus_slice[i].pwr_usage = (long long)power;
 						if (gpus_slice[i].pwr_usage > gpus_slice[i].pwr_max_usage)
@@ -1539,7 +1580,7 @@ namespace Gpu {
     				result = nvmlDeviceGetPowerState(devices[i], &pState);
     				if (result != NVML_SUCCESS) {
 						Logger::warning("NVML: Failed to get GPU power state: {}", nvmlErrorString(result));
-						if constexpr(is_init) gpus_slice[i].supported_functions.pwr_state = false;
+						if (probe) gpus_slice[i].supported_functions.pwr_state = false;
     				} else gpus_slice[i].pwr_state = static_cast<int>(pState);
     			}
 
@@ -1551,7 +1592,7 @@ namespace Gpu {
 						nvmlReturn_t result = nvmlDeviceGetTemperature(devices[i], NVML_TEMPERATURE_GPU, &temp);
     					if (result != NVML_SUCCESS) {
 							Logger::warning("NVML: Failed to get GPU temperature: {}", nvmlErrorString(result));
-							if constexpr(is_init) gpus_slice[i].supported_functions.temp_info = false;
+							if (probe) gpus_slice[i].supported_functions.temp_info = false;
     					} else gpus_slice[i].temp.push_back((long long)temp);
 					}
 				}
@@ -1563,8 +1604,8 @@ namespace Gpu {
 					result = nvmlDeviceGetMemoryInfo(devices[i], &memory);
     				if (result != NVML_SUCCESS) {
 						Logger::warning("NVML: Failed to get VRAM info: {}", nvmlErrorString(result));
-						if constexpr(is_init) gpus_slice[i].supported_functions.mem_total = false;
-						if constexpr(is_init) gpus_slice[i].supported_functions.mem_used = false;
+						if (probe) gpus_slice[i].supported_functions.mem_total = false;
+						if (probe) gpus_slice[i].supported_functions.mem_used = false;
 					} else {
 						gpus_slice[i].mem_total = memory.total;
 						gpus_slice[i].mem_used = memory.used;
@@ -1583,7 +1624,7 @@ namespace Gpu {
 					result = nvmlDeviceGetEncoderUtilization(devices[i], &utilization, &samplingPeriodUs);
 					if (result != NVML_SUCCESS) {
 						Logger::warning("NVML: Failed to get encoder utilization: {}", nvmlErrorString(result));
-						if constexpr(is_init) gpus_slice[i].supported_functions.encoder_utilization = false;
+						if (probe) gpus_slice[i].supported_functions.encoder_utilization = false;
 					} else gpus_slice[i].encoder_utilization = (long long)utilization;
 				}
 
@@ -1595,7 +1636,7 @@ namespace Gpu {
 					result = nvmlDeviceGetDecoderUtilization(devices[i], &utilization, &samplingPeriodUs);
 					if (result != NVML_SUCCESS) {
 						Logger::warning("NVML: Failed to get decoder utilization: {}", nvmlErrorString(result));
-						if constexpr(is_init) gpus_slice[i].supported_functions.decoder_utilization = false;
+						if (probe) gpus_slice[i].supported_functions.decoder_utilization = false;
 					} else gpus_slice[i].decoder_utilization = (long long)utilization;
 				}
 
@@ -1612,15 +1653,17 @@ namespace Gpu {
 
 				// nvTimer.stop_rename_reset("Nv pcie thread join");
 				//? Join PCIE TX/RX threads
-				if constexpr(is_init) { // there doesn't seem to be a better way to do this, but this should be fine considering it's just 2 lines
+				if (probe) { // there doesn't seem to be a better way to do this, but this should be fine considering it's just 2 lines
 					pcie_tx_thread.join();
 					pcie_rx_thread.join();
 				} else if (gpus_slice[i].supported_functions.pcie_txrx and Config::getB("nvml_measure_pcie_speeds")) {
 					pcie_tx_thread.join();
 					pcie_rx_thread.join();
 				}
+				probed[i] = true;
     		}
 
+			// Metadata probing is tracked per device.
 			return true;
 		}
     }

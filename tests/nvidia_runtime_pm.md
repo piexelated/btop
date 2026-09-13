@@ -1,0 +1,28 @@
+# NVIDIA runtime power management
+
+The Linux collector enumerates NVIDIA display functions through PCI sysfs before
+loading NVML. It reserves stable slots for sleeping GPUs so Intel/AMD indices do
+not shift when NVIDIA wakes. NVML handles are matched by PCI address.
+
+When any discovered NVIDIA GPU does not report `active` in
+`power/runtime_status`, no NVML initialization or collection takes place.
+Suspended GPUs show `Sleeping`; transitional or unreadable status shows
+`Monitoring paused`. This applies on AC and battery. Because legacy NVML
+initialization can attach multiple GPUs, monitoring pauses for all NVIDIA GPUs
+when one is asleep. No zero-watt measurement is claimed while asleep.
+
+For active GPUs, each sample initializes NVML, collects data, joins its PCIe
+threads, and shuts NVML down. btop keeps no NVIDIA attachment between refreshes.
+The kernel-state check and NVML call are not atomic; this does not prove that a
+GPU cannot suspend between the check and the first driver call. Real suspend
+behavior also depends on the driver and other clients.
+
+Run `python3 tests/nvidia_runtime_pm.py` after building. The test runs the real
+binary in a PTY with an isolated config and a mock NVIDIA library. It redirects
+power-status reads without changing sysfs and checks suspended startup, two
+wake/sleep cycles, missing/transitional state, and balanced init/shutdown calls.
+It requires a NVIDIA PCI device for discovery, but makes no real NVIDIA API calls.
+
+Also smoke-tested against this laptop's real NVIDIA and Intel drivers: normal UI
+and metrics work, and `/proc/PID/fd` contains no NVIDIA device files between
+samples. Physical D3 suspension remains to be checked after other GPU clients exit.

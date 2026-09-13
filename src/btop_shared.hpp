@@ -151,6 +151,7 @@ namespace Gpu {
 
 	//* Per-device container for GPU info
 	struct gpu_info {
+		string monitor_status; // Nonempty when live GPU queries are paused.
 		std::unordered_map<string, deque<long long>> gpu_percent = {
 			{"gpu-totals", {}},
 			{"gpu-rc-totals", {}},
@@ -158,11 +159,11 @@ namespace Gpu {
 			{"gpu-vram-totals", {}},
 			{"gpu-pwr-totals", {}},
 		};
-		unsigned int gpu_clock_speed; // MHz
+		unsigned int gpu_clock_speed = 0; // MHz
 
-		long long pwr_usage; // mW
+		long long pwr_usage = 0; // mW
 		long long pwr_max_usage = 255000;
-		long long pwr_state;
+		long long pwr_state = 32;
 
 		deque<long long> temp = {0};
 		long long temp_max = 110;
