@@ -208,6 +208,7 @@ namespace Gpu {
 		nvmlReturn_t (*nvmlInit)();
 		nvmlReturn_t (*nvmlShutdown)();
 		nvmlReturn_t (*nvmlDeviceGetCount)(unsigned int*);
+		nvmlReturn_t (*nvmlDeviceGetHandleByIndex)(unsigned int, nvmlDevice_t*);
 		nvmlReturn_t (*nvmlDeviceGetHandleByPciBusId_v2)(const char*, nvmlDevice_t*);
 		nvmlReturn_t (*nvmlDeviceGetName)(nvmlDevice_t, char*, unsigned int);
 		nvmlReturn_t (*nvmlDeviceGetPowerManagementLimit)(nvmlDevice_t, unsigned int*);
@@ -229,7 +230,7 @@ namespace Gpu {
 		bool shutdown();
 		template <bool is_init> bool collect(gpu_info* gpus_slice);
 		vector<nvmlDevice_t> devices;
-		vector<fs::path> pci_devices;
+		vector<fs::path> pci_devices; // Empty when GPUs are only visible through NVML (WSL2, some VMs).
 		vector<bool> probed;
 		unsigned int device_count = 0;
 	}
@@ -1322,20 +1323,44 @@ namespace Cpu {
 namespace Gpu {
     //? NVIDIA
     namespace Nvml {
-		bool init() {
-			if (initialized) return false;
-
-			// Enumerate through sysfs without opening a NVIDIA device or initializing NVML.
+		// Enumerate through sysfs without opening a NVIDIA device or initializing NVML.
+		static vector<fs::path> find_pci_display_functions() {
+			vector<fs::path> found;
 			std::error_code ec;
 			for (const auto& entry : fs::directory_iterator("/sys/bus/pci/devices", ec)) {
 				string vendor, device_class;
 				ifstream(entry.path() / "vendor") >> vendor;
 				ifstream(entry.path() / "class") >> device_class;
 				if (vendor == "0x10de" and (device_class.starts_with("0x0300") or device_class.starts_with("0x0302")))
-					pci_devices.push_back(entry.path());
+					found.push_back(entry.path());
 			}
-			std::sort(pci_devices.begin(), pci_devices.end());
-			if (pci_devices.empty()) return false;
+			std::sort(found.begin(), found.end());
+			return found;
+		}
+
+		static unsigned int count_nvml_devices() {
+			if (nvmlInit() != NVML_SUCCESS) return 0;
+			unsigned int count = 0;
+			if (nvmlDeviceGetCount(&count) != NVML_SUCCESS) count = 0;
+			nvmlShutdown();
+			return count;
+		}
+
+		static nvmlReturn_t get_device_handle(unsigned int index) {
+			if (pci_devices.empty())
+				return nvmlDeviceGetHandleByIndex(index, devices.data() + index);
+			return nvmlDeviceGetHandleByPciBusId_v2(pci_devices[index].filename().c_str(), devices.data() + index);
+		}
+
+		// "unsupported" means runtime PM is disabled, so the GPU cannot be asleep.
+		static bool is_safe_to_query(const string& runtime_status) {
+			return runtime_status == "active" or runtime_status == "unsupported";
+		}
+
+		bool init() {
+			if (initialized) return false;
+
+			pci_devices = find_pci_display_functions();
 
 			//? Dynamic loading & linking
 			//? Try possible library names for libnvidia-ml.so
@@ -1370,6 +1395,7 @@ namespace Gpu {
 		    LOAD_SYM(nvmlInit);
 		    LOAD_SYM(nvmlShutdown);
 		    LOAD_SYM(nvmlDeviceGetCount);
+		    LOAD_SYM(nvmlDeviceGetHandleByIndex);
 		    LOAD_SYM(nvmlDeviceGetHandleByPciBusId_v2);
 		    LOAD_SYM(nvmlDeviceGetName);
 		    LOAD_SYM(nvmlDeviceGetPowerManagementLimit);
@@ -1386,13 +1412,17 @@ namespace Gpu {
 
             #undef LOAD_SYM
 
-			device_count = pci_devices.size();
+			device_count = pci_devices.empty() ? count_nvml_devices() : pci_devices.size();
+			if (device_count == 0) {
+				dlclose(nvml_dl_handle);
+				return false;
+			}
 			devices.resize(device_count);
 			probed.resize(device_count, false);
 			gpus.resize(device_count);
 			gpu_names.resize(device_count);
 			for (unsigned int i = 0; i < device_count; ++i) {
-				gpu_names[i] = "NVIDIA " + pci_devices[i].filename().string();
+				gpu_names[i] = "NVIDIA " + (pci_devices.empty() ? to_string(i) : pci_devices[i].filename().string());
 				for (auto& [_, history] : gpus[i].gpu_percent) history.push_back(0);
 			}
 			initialized = true; // Library loaded, not a persistent NVML attachment.
@@ -1411,7 +1441,7 @@ namespace Gpu {
 		bool collect(gpu_info* gpus_slice) { // raw pointer to vector data, size == device_count
 			if (!initialized) return false;
 
-			// nvmlInit can attach every NVIDIA GPU, so skip it if any is not active.
+			// nvmlInit can attach every NVIDIA GPU, so skip it if any might be asleep.
 			// Unknown/missing state is deliberately treated as unsafe to query.
 			bool all_active = true;
 			vector<string> states;
@@ -1419,7 +1449,7 @@ namespace Gpu {
 				string state;
 				ifstream(pci / "power/runtime_status") >> state;
 				states.push_back(state);
-				all_active = all_active and state == "active";
+				all_active = all_active and is_safe_to_query(state);
 			}
 			if (!all_active) {
 				for (unsigned int i = 0; i < device_count; ++i) {
@@ -1460,9 +1490,9 @@ namespace Gpu {
 			join_thread pcie_rx_thread;
 			// DebugTimer nvTotalTimer("Nvidia Total");
 			for (unsigned int i = 0; i < device_count; ++i) {
-				// Handles are only valid for this NVML sample. Match PCI IDs, not NVML order.
+				// Handles are only valid for this NVML sample.
 				const bool probe = !probed[i];
-				result = nvmlDeviceGetHandleByPciBusId_v2(pci_devices[i].filename().c_str(), devices.data() + i);
+				result = get_device_handle(i);
         			if (result != NVML_SUCCESS) {
     					Logger::warning("NVML: Failed to get device handle: {}", nvmlErrorString(result));
 						gpus_slice[i].monitor_status = "Monitoring unavailable";

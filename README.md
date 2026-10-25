@@ -1,5 +1,13 @@
 # ![btop++](Img/logo.png)
 
+> **This is a personal fork of [aristocratos/btop](https://github.com/aristocratos/btop), not the official release.**
+> What's different from upstream:
+> - **Intel Xe GPUs** (Lunar Lake, Battlemage, newer Arc). Includes the not-yet-merged [PR #1457](https://github.com/aristocratos/btop/pull/1457) by World, since upstream only supports the older i915 driver.
+> - **GPU clock in the compact CPU box**, so you can see clocks without opening a GPU box.
+> - **NVIDIA laptops can keep their dGPU asleep.** Upstream btop holds NVML open all the time, which stops a hybrid-graphics laptop's NVIDIA GPU from entering runtime suspend and drains the battery. This fork only calls NVML when the GPU is already awake, releases it after every sample, and shows `Sleeping` otherwise. GPUs that only NVML can see (WSL2, some VMs) still work. Details: [tests/nvidia_runtime_pm.md](tests/nvidia_runtime_pm.md).
+>
+> Build and install exactly like upstream (`make GPU_SUPPORT=true`). Everything below is the upstream README.
+
 <a href="https://repology.org/project/btop/versions">
     <img src="https://repology.org/badge/vertical-allrepos/btop.svg" alt="Packaging status" align="right">
 </a>
